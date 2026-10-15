@@ -35,6 +35,8 @@ jobs:
         # Folder under the cPanel home dir (repo variable APP_PATH, default: laravel-jdd)
         env:
             APP_PATH: ${{ vars.APP_PATH || 'laravel-jdd' }}
+            # Web root under the cPanel home dir, symlinked to $APP_PATH/public (repo variable PUBLIC_PATH, default: public_html)
+            PUBLIC_PATH: ${{ vars.PUBLIC_PATH || 'public_html' }}
             APP_URL: ${{ vars.APP_URL || '(set the APP_URL variable)' }}
 
         steps:
@@ -141,6 +143,18 @@ jobs:
 
                       php artisan migrate --force
                       php artisan storage:link || true
+
+                      # Point the web root at the app's public/ (a real folder is backed up once, never deleted)
+                      WEB_ROOT=/home/${{ secrets.SSH_USERNAME }}/${{ env.PUBLIC_PATH }}
+                      APP_PUBLIC=/home/${{ secrets.SSH_USERNAME }}/${{ env.APP_PATH }}/public
+                      if [ -e "$WEB_ROOT" ] && [ ! -L "$WEB_ROOT" ]; then
+                        mv "$WEB_ROOT" "$WEB_ROOT.bak-$(date +%Y%m%d%H%M%S)"
+                        echo "ℹ️ Existing $WEB_ROOT backed up"
+                      fi
+                      mkdir -p "$(dirname "$WEB_ROOT")"
+                      ln -sfn "$APP_PUBLIC" "$WEB_ROOT"
+                      echo "✅ $WEB_ROOT -> $APP_PUBLIC"
+
                       php artisan optimize:clear
                       php artisan optimize
                       echo "✅ Post-deploy setup done"
@@ -154,6 +168,7 @@ jobs:
                   {
                     echo "### Deployment: $JOB_STATUS"
                     echo "- Folder: \`~/$APP_PATH\`"
+                    echo "- Web root: \`~/$PUBLIC_PATH\` -> \`~/$APP_PATH/public\`"
                     echo "- URL: $APP_URL"
                     echo "- Commit: \`${DEPLOY_SHA::7}\`"
                   } >> "$GITHUB_STEP_SUMMARY"
