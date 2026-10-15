@@ -129,6 +129,11 @@ jobs:
                       fi
                       chmod 600 .env
 
+                      # rsync excludes these, so create them on first deploy (package:discover needs bootstrap/cache)
+                      mkdir -p bootstrap/cache storage/logs storage/app/public \
+                        storage/framework/cache/data storage/framework/sessions storage/framework/views
+                      chmod -R ug+rwX bootstrap/cache storage
+
                       composer install --no-dev --optimize-autoloader --no-interaction
 
                       php artisan down --retry=15 || true
