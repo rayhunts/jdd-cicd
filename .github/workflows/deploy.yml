@@ -1,0 +1,162 @@
+name: Deploy
+
+on:
+    # Runs only after the "tests" workflow (tests.yml) finishes on main
+    workflow_run:
+        workflows: [tests]
+        types: [completed]
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: deploy-production
+    cancel-in-progress: false
+
+env:
+    PHP_VERSION: '8.3'
+    NODE_VERSION: '22'
+
+jobs:
+    deploy:
+        name: Deploy
+        runs-on: ubuntu-latest
+        # Only deploy tested pushes to main from this repo (never PRs/forks, which also run tests.yml)
+        if: >-
+            github.event_name == 'workflow_dispatch' || (
+              github.event.workflow_run.conclusion == 'success' &&
+              github.event.workflow_run.event == 'push' &&
+              github.event.workflow_run.head_branch == 'main' &&
+              github.event.workflow_run.head_repository.full_name == github.repository
+            )
+
+        # Folder under the cPanel home dir (repo variable APP_PATH, default: laravel-jdd)
+        env:
+            APP_PATH: ${{ vars.APP_PATH || 'laravel-jdd' }}
+            APP_URL: ${{ vars.APP_URL || '(set the APP_URL variable)' }}
+
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+              with:
+                  ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+                  persist-credentials: false
+
+            - name: Setup PHP
+              uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # v2
+              with:
+                  php-version: ${{ env.PHP_VERSION }}
+                  tools: composer:v2
+                  coverage: none
+
+            - name: Setup Node.js
+              uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+              with:
+                  node-version: ${{ env.NODE_VERSION }}
+
+            - name: Write .env from GitHub secret
+              env:
+                  ENV_FILE: ${{ secrets.ENV_FILE }}
+              run: |
+                  if [ -z "$ENV_FILE" ]; then
+                    echo "❌ Secret ENV_FILE is empty or missing."
+                    exit 1
+                  fi
+                  printf '%s\n' "$ENV_FILE" > .env
+                  echo "✅ .env written ($(wc -l < .env) lines)"
+
+            # Wayfinder's Vite plugin runs `php artisan wayfinder:generate` during the build
+            - name: Install dependencies
+              run: |
+                  composer install --no-dev --no-interaction --prefer-dist --optimize-autoloader
+                  npm ci
+
+            - name: Build frontend assets
+              run: npm run build
+
+            - name: Deploy to cPanel via rsync
+              uses: burnett01/rsync-deployments@v9
+              with:
+                  # -r recursive, -l keep symlinks, -t keep timestamps, -z compress
+                  # Only changed files are sent. Excluded paths on the server are never touched.
+                  switches: >-
+                      -rltz
+                      --include=/.env
+                      --exclude=.git*
+                      --exclude=node_modules/
+                      --exclude=vendor/
+                      --exclude=tests/
+                      --exclude=.env*
+                      --exclude=database/*.sqlite*
+                      --exclude=database/backups/
+                      --exclude=storage/logs/
+                      --exclude=storage/framework/cache/
+                      --exclude=storage/framework/sessions/
+                      --exclude=storage/framework/views/
+                      --exclude=storage/framework/testing/
+                      --exclude=storage/app/public/
+                      --exclude=public/storage
+                      --exclude=public/hot
+                      --exclude=bootstrap/cache/
+                      --exclude=bootstrap/ssr/
+                      --exclude=.DS_Store
+                      --exclude=*.log
+                  path: ./
+                  remote_path: /home/${{ secrets.SSH_USERNAME }}/${{ env.APP_PATH }}/
+                  remote_host: ${{ secrets.SSH_HOST }}
+                  remote_port: ${{ secrets.SSH_PORT || 22 }}
+                  remote_user: ${{ secrets.SSH_USERNAME }}
+                  remote_key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+            - name: Install dependencies and setup via SSH
+              uses: appleboy/ssh-action@v1.2.5
+              with:
+                  host: ${{ secrets.SSH_HOST }}
+                  username: ${{ secrets.SSH_USERNAME }}
+                  key: ${{ secrets.SSH_PRIVATE_KEY }}
+                  port: ${{ secrets.SSH_PORT || 22 }}
+                  script: |
+                      set -e
+                      cd /home/${{ secrets.SSH_USERNAME }}/${{ env.APP_PATH }}
+
+                      if [ ! -f .env ]; then
+                        echo "❌ .env file not found! Check the ENV_FILE secret and the rsync step."
+                        exit 1
+                      fi
+                      chmod 600 .env
+
+                      composer install --no-dev --optimize-autoloader --no-interaction
+
+                      php artisan down --retry=15 || true
+                      trap 'php artisan up' EXIT
+
+                      # SQLite: create on first deploy, back up before migrating, keep the last 5
+                      mkdir -p database/backups
+                      touch database/database.sqlite
+                      cp database/database.sqlite "database/backups/database-$(date +%Y%m%d%H%M%S).sqlite"
+                      ls -t database/backups/*.sqlite | tail -n +6 | xargs -r rm --
+                      echo "✅ Database backed up"
+
+                      php artisan migrate --force
+                      php artisan storage:link || true
+                      php artisan optimize:clear
+                      php artisan optimize
+                      echo "✅ Post-deploy setup done"
+
+            - name: Deployment summary
+              if: always()
+              env:
+                  DEPLOY_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+                  JOB_STATUS: ${{ job.status }}
+              run: |
+                  {
+                    echo "### Deployment: $JOB_STATUS"
+                    echo "- Folder: \`~/$APP_PATH\`"
+                    echo "- URL: $APP_URL"
+                    echo "- Commit: \`${DEPLOY_SHA::7}\`"
+                  } >> "$GITHUB_STEP_SUMMARY"
+                  if [ "$JOB_STATUS" != "success" ]; then
+                    echo "- Check ~/$APP_PATH/storage/logs/laravel.log and SSH secrets; DB backups in ~/$APP_PATH/database/backups/" >> "$GITHUB_STEP_SUMMARY"
+                  fi
